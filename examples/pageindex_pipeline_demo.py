@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the local PageIndex pipeline: index, persist workspace, restore, read back."""
+"""Run the local PageIndex pipeline: index, restore, retrieve, and optionally answer."""
 
 from __future__ import annotations
 
@@ -44,6 +44,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--retrieve-model",
         default=None,
         help="Retrieve model passed to PageIndexClient. This script does not run an agent.",
+    )
+    parser.add_argument(
+        "--question",
+        default=None,
+        help="Optional question. When set, the script retrieves relevant pages and generates an answer.",
+    )
+    parser.add_argument(
+        "--qa-model",
+        default=None,
+        help="Model used for optional page selection and answer generation.",
     )
     parser.add_argument(
         "--pages",
@@ -98,10 +108,79 @@ def _load_json_string(payload: str) -> object:
         return {"raw": payload}
 
 
+def _normalize_pages(value: object, fallback: str) -> str:
+    if isinstance(value, list):
+        pages = [str(item).strip() for item in value if str(item).strip()]
+        return ",".join(pages) or fallback
+    if isinstance(value, str):
+        return value.strip() or fallback
+    return fallback
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def run_qa_pipeline(
+    client: object,
+    doc_id: str,
+    question: str,
+    qa_model: str,
+    fallback_pages: str,
+    llm_func: object | None = None,
+) -> dict[str, object]:
+    if llm_func is None:
+        from pageindex.utils import llm_completion
+
+        llm_func = llm_completion
+
+    structure = _load_json_string(client.get_document_structure(doc_id))
+    selection_prompt = f"""
+You are using a PageIndex document tree to retrieve context for a question.
+Pick the tightest page range or comma-separated page list that is likely to answer the question.
+Return JSON only, with this schema:
+{{"thinking": "brief reason", "pages": "2-4"}}
+
+Question:
+{question}
+
+PageIndex structure JSON:
+{json.dumps(structure, ensure_ascii=False)}
+""".strip()
+    selection_raw = llm_func(qa_model, selection_prompt)
+    selection = _load_json_string(selection_raw)
+
+    selected_pages = fallback_pages
+    if isinstance(selection, dict):
+        selected_pages = _normalize_pages(
+            selection.get("pages") or selection.get("page") or selection.get("selected_pages"),
+            fallback_pages,
+        )
+
+    page_content = _load_json_string(client.get_page_content(doc_id, selected_pages))
+    answer_prompt = f"""
+Answer the question using only the retrieved page content below.
+If the content is insufficient, say what is missing instead of guessing.
+Cite page numbers inline when possible.
+
+Question:
+{question}
+
+Retrieved page content JSON:
+{json.dumps(page_content, ensure_ascii=False)}
+""".strip()
+    answer = llm_func(qa_model, answer_prompt)
+
+    return {
+        "question": question,
+        "qa_model": qa_model,
+        "selection": selection,
+        "selected_pages": selected_pages,
+        "page_content": page_content,
+        "answer": answer,
+    }
 
 
 def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
@@ -154,6 +233,21 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
     _write_json(dump_dir / "structure.json", structure)
     _write_json(dump_dir / "page_content.json", page_content)
 
+    qa_result = None
+    qa_result_path = None
+    if args.question:
+        qa_model = args.qa_model or args.retrieve_model or args.model or restored.retrieve_model
+        print("[QA] Selecting pages from the structure and generating an answer...")
+        qa_result = run_qa_pipeline(
+            client=restored,
+            doc_id=doc_id,
+            question=args.question,
+            qa_model=qa_model,
+            fallback_pages=args.pages,
+        )
+        qa_result_path = dump_dir / "qa_result.json"
+        _write_json(qa_result_path, qa_result)
+
     result = {
         "doc_id": doc_id,
         "workspace": str(workspace),
@@ -162,6 +256,10 @@ def run_pipeline(args: argparse.Namespace) -> dict[str, object]:
         "dump_dir": str(dump_dir),
         "metadata": metadata,
     }
+    if qa_result is not None:
+        result["qa_result_path"] = str(qa_result_path)
+        result["selected_pages"] = qa_result["selected_pages"]
+        result["answer"] = qa_result["answer"]
 
     print("\nPipeline completed.")
     print(json.dumps(result, ensure_ascii=False, indent=2))
